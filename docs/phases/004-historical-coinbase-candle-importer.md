@@ -1,8 +1,8 @@
 # Phase 004 — Historical Coinbase Candle Importer
 
-**Status:** Ready for implementation  
-**Date:** 2026-09-28  
-**Primary authority:** `AGENTS.md`, `MASTER_ENGINEERING_SPEC.md`, ADRs 0001–0009  
+**Status:** Ready for implementation
+**Date:** 2026-09-28
+**Primary authority:** `AGENTS.md`, `MASTER_ENGINEERING_SPEC.md`, ADRs 0001–0009
 **Depends on:** Phase 003 accepted at commit `beefeda778bf6abf0e80dfb4f50f003f01c11d00`
 
 ## 1. Objective
