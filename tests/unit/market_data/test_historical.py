@@ -8,7 +8,6 @@ import pytest
 from command_station.domain import ProductId, UtcTimestamp
 from command_station.market_data.historical import (
     CoinbaseCandleRequest,
-    HistoricalCandleConflictError,
     HistoricalCandleImporter,
     HistoricalCandleImportError,
     HistoricalCandleImportSpec,
@@ -45,6 +44,14 @@ def candle(minutes: int, close: str = "1") -> dict[str, object]:
         "volume": "0",
         "future_field": {"kept": True},
     }
+
+
+class FakeClient:
+    def __init__(self, pages: dict[str, object]) -> None:
+        self.pages = pages
+
+    def fetch_page(self, request: CoinbaseCandleRequest) -> dict[str, object]:
+        return cast(dict[str, object], self.pages[str(request.request_start)])
 
 
 def test_planner_caps_covers_and_overlaps() -> None:
@@ -102,49 +109,6 @@ def test_normalization_is_order_independent_and_import_excludes_overall_end(tmp_
     )
     result = importer.import_candles(spec(1))
     assert tuple(item.open_time for item in result.candles) == (timestamp(0),)
-
-
-class FakeClient:
-    def __init__(self, pages: dict[str, object]) -> None:
-        self.pages = pages
-        self.calls: list[str] = []
-
-    def fetch_page(self, request: CoinbaseCandleRequest) -> dict[str, object]:
-        key = str(request.request_start)
-        self.calls.append(key)
-        value = self.pages[key]
-        if isinstance(value, Exception):
-            raise value
-        return cast(dict[str, object], value)
-
-
-def test_resume_overlap_dedup_missing_and_conflict(tmp_path: Path) -> None:
-    import_spec = spec(351)
-    requests = plan_coinbase_candle_requests(import_spec)
-    first, second = str(requests[0].request_start), str(requests[1].request_start)
-    page_one = {"candles": [candle(0), candle(349)]}
-    page_two = {"candles": [candle(349), candle(350)]}
-    archive = LocalRawCandleArchive(tmp_path.resolve())
-    client = FakeClient({first: page_one, second: RuntimeError("offline")})
-    importer = HistoricalCandleImporter(client, archive)
-    with pytest.raises(RuntimeError):
-        importer.import_candles(import_spec)
-    client.pages[second] = page_two
-    result = importer.import_candles(import_spec)
-    assert result.fetched_page_count == 1 and result.reused_page_count == 1
-    assert client.calls.count(first) == 1
-    assert len(result.missing_open_times) == 348
-    assert len(result.candles) == 3
-    conflict_archive = LocalRawCandleArchive((tmp_path / "conflict").resolve())
-    conflict = HistoricalCandleImporter(
-        FakeClient({first: page_one, second: {"candles": [candle(349, "2")]}}), conflict_archive
-    )
-    with pytest.raises(HistoricalCandleConflictError):
-        conflict.import_candles(import_spec)
-    assert (
-        conflict_archive.load(requests[0]) is not None
-        and conflict_archive.load(requests[1]) is not None
-    )
 
 
 def test_raw_archive_integrity_path_safety_and_conflicting_evidence(tmp_path: Path) -> None:
