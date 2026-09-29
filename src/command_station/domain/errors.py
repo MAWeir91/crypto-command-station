@@ -27,3 +27,7 @@ class UnsupportedTimeframeError(DomainValidationError):
 
 class InvalidCandleError(DomainValidationError):
     """Raised when OHLCV data cannot form a structurally valid candle."""
+
+
+class InvalidProductSpecError(DomainValidationError):
+    """Raised when product constraints cannot form a valid spot specification."""

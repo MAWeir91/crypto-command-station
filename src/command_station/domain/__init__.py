@@ -13,11 +13,13 @@ from command_station.domain.errors import (
     InvalidCandleError,
     InvalidDecimalError,
     InvalidIdentifierError,
+    InvalidProductSpecError,
     InvalidTimestampError,
     UnsupportedTimeframeError,
 )
 from command_station.domain.ids import AssetSymbol, EntityId, ProductId
 from command_station.domain.market import Candle, Side, Timeframe
+from command_station.domain.products import ProductCatalogSnapshot, ProductSpec, ProductType, Venue
 from command_station.domain.time import UtcTimestamp
 
 __all__ = [
@@ -30,12 +32,17 @@ __all__ = [
     "InvalidCandleError",
     "InvalidDecimalError",
     "InvalidIdentifierError",
+    "InvalidProductSpecError",
     "InvalidTimestampError",
     "ProductId",
+    "ProductCatalogSnapshot",
+    "ProductSpec",
+    "ProductType",
     "Side",
     "Timeframe",
     "UnsupportedTimeframeError",
     "UtcTimestamp",
+    "Venue",
     "decimal_to_text",
     "require_non_negative",
     "require_positive",
