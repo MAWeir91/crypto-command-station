@@ -5,6 +5,13 @@ from command_station.market_data.derived_cache import (
     DerivedCacheIntegrityError,
     LocalDerivedCandleCache,
 )
+from command_station.market_data.replay import (
+    BarReference,
+    HistoricalReplayFeed,
+    MarketReplayBatch,
+    MarketStreamKey,
+    ReplayDataError,
+)
 from command_station.market_data.resampling import (
     RESAMPLER_VERSION,
     DerivedCacheKey,
@@ -20,6 +27,7 @@ from command_station.market_data.resampling import (
 
 __all__ = [
     "DERIVED_CACHE_SCHEMA_VERSION",
+    "BarReference",
     "RESAMPLER_VERSION",
     "DerivedCacheIntegrityError",
     "DerivedCacheKey",
@@ -27,6 +35,10 @@ __all__ = [
     "DerivedDatasetValidationError",
     "DerivedGapRecord",
     "LocalDerivedCandleCache",
+    "HistoricalReplayFeed",
+    "MarketReplayBatch",
+    "MarketStreamKey",
+    "ReplayDataError",
     "ResampleBucket",
     "ResampledCandleDataset",
     "derive_cache_key",
