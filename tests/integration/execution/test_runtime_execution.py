@@ -1,3 +1,6 @@
+from decimal import Decimal
+
+from command_station.accounting import InitialHolding, SpotAccountingEngine, SpotAccountSpec
 from command_station.domain import ProductId, Side
 from command_station.execution import (
     BaseQuantity,
@@ -26,7 +29,7 @@ from tests.runtime_fixtures import canonical
 def test_runtime_activation_after_step_fills_only_next_open_before_publication() -> None:
     source = canonical("BTC-USD", minutes=3)
     feed = HistoricalReplayFeed((source,))
-    runtime = ReferenceTradingRuntime(clock=SimulatedClock(feed.start), market_feed=feed)
+    runtime = _funded_runtime(feed)
     first = runtime.step()
     assert first is not None and first.fills == ()
     request = normalize_order_intent(
@@ -39,7 +42,7 @@ def test_runtime_activation_after_step_fills_only_next_open_before_publication()
         ),
         product(),
     )
-    runtime.activate_order(request)
+    runtime.activate_order(request, max_quote_reservation=Decimal("1000"))
     second = runtime.step()
     assert second is not None and len(second.fills) == 1
     assert second.fills[0].market_interval_open == source.candles[1].open_time
@@ -47,6 +50,8 @@ def test_runtime_activation_after_step_fills_only_next_open_before_publication()
         RuntimeEventKind.CLOCK_ADVANCED,
         RuntimeEventKind.MARKET_ACTIVITY,
         RuntimeEventKind.EXECUTION_PROCESSED,
+        RuntimeEventKind.ACCOUNTING_APPLIED,
+        RuntimeEventKind.PORTFOLIO_UPDATED,
         RuntimeEventKind.BARS_PUBLISHED,
         RuntimeEventKind.MARKET_STATE_READY,
     ]
@@ -56,10 +61,8 @@ def test_multi_product_interval_order_does_not_change_execution() -> None:
     btc, eth = canonical("BTC-USD", minutes=2), canonical("ETH-USD", minutes=2)
     first_feed = HistoricalReplayFeed((btc, eth))
     second_feed = HistoricalReplayFeed((eth, btc))
-    first = ReferenceTradingRuntime(clock=SimulatedClock(first_feed.start), market_feed=first_feed)
-    second = ReferenceTradingRuntime(
-        clock=SimulatedClock(second_feed.start), market_feed=second_feed
-    )
+    first = _funded_runtime(first_feed)
+    second = _funded_runtime(second_feed)
     for runtime in (first, second):
         for product_id in ("BTC-USD", "ETH-USD"):
             runtime.activate_order(
@@ -72,7 +75,8 @@ def test_multi_product_interval_order_does_not_change_execution() -> None:
                         created_at=runtime.clock.now,
                     ),
                     product(product_id),
-                )
+                ),
+                max_quote_reservation=Decimal("1000"),
             )
     assert first.run().execution_fingerprint == second.run().execution_fingerprint
 
@@ -101,7 +105,7 @@ def _runtime_with_prices(
         ),
     )
     feed = HistoricalReplayFeed((source,))
-    return source, ReferenceTradingRuntime(clock=SimulatedClock(feed.start), market_feed=feed)
+    return source, _funded_runtime(feed)
 
 
 def _request(
@@ -222,7 +226,10 @@ def test_fresh_equivalent_runtime_compositions_have_identical_execution() -> Non
             )
         )
         runtime.step()
-        runtime.activate_order(_request(runtime, side=Side.BUY, order_type=OrderType.MARKET))
+        runtime.activate_order(
+            _request(runtime, side=Side.BUY, order_type=OrderType.MARKET),
+            max_quote_reservation=Decimal("1000"),
+        )
         result = runtime.run()
         return result, runtime.broker.fills, runtime.broker.orders, runtime.trace_fingerprint
 
@@ -233,3 +240,18 @@ def test_fresh_equivalent_runtime_compositions_have_identical_execution() -> Non
     assert first[0].execution_fingerprint == second[0].execution_fingerprint
     assert first[2] == second[2]
     assert first[3] == second[3]
+
+
+def _funded_runtime(feed: HistoricalReplayFeed) -> ReferenceTradingRuntime:
+    products = tuple(product(source.product_id.value) for source in feed.canonical_sources)
+    account = SpotAccountingEngine(
+        SpotAccountSpec(
+            initial_cash="100000",
+            product_specs=products,
+            initial_holdings=tuple(InitialHolding(p.product_id, "10", "100") for p in products),
+        ),
+        feed.start,
+    )
+    return ReferenceTradingRuntime(
+        clock=SimulatedClock(feed.start), market_feed=feed, accounting=account
+    )

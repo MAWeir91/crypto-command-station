@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from command_station.accounting import InitialHolding, SpotAccountingEngine, SpotAccountSpec
 from command_station.domain import ProductId, Side
 from command_station.execution import (
     BaseQuantity,
@@ -97,7 +98,18 @@ def test_same_minute_stop_target_golden_is_conservative() -> None:
 def test_existing_stop_executes_before_bar_publication_golden() -> None:
     source = canonical("BTC-USD", minutes=2)
     feed = HistoricalReplayFeed((source,))
-    runtime = ReferenceTradingRuntime(clock=SimulatedClock(feed.start), market_feed=feed)
+    runtime = ReferenceTradingRuntime(
+        clock=SimulatedClock(feed.start),
+        market_feed=feed,
+        accounting=SpotAccountingEngine(
+            SpotAccountSpec(
+                initial_cash="1000",
+                product_specs=(product(),),
+                initial_holdings=(InitialHolding(product().product_id, "10", "100"),),
+            ),
+            feed.start,
+        ),
+    )
     runtime.activate_order(
         request(
             OrderType.STOP_MARKET,
