@@ -1,0 +1,1 @@
+"""Accounting golden test package."""

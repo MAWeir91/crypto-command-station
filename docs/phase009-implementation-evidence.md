@@ -76,3 +76,33 @@ git diff --check
 Results: **73 passed in 3.00s; strict mypy clean in 15 source files; 3 files already formatted; Ruff lint clean; diff whitespace clean**. The repair required one focused pytest execution and one focused mypy execution; no broad acceptance checks were duplicated.
 
 Inherited QA environment ledger preserved: full Ruff format scanning `.` panics with Expected a ruff source file; full pytest temporary teardown scanning produces WinError5 and unresolved E/F indicators; `uv run pytest` console form cannot resolve local `tests` modules while `uv run python -m pytest` focused composition passes. Default uv cache denial remains unchanged. Existing `.venv` focused repair commands introduced no additional environment blocker.
+
+## Published CI console collection repair
+
+Owner readiness: PASS. The published Phase009 commit `673cb74d81b55a4264b51b6223238aaf6a7980ae` failed the literal pytest console entry point in both remote Python 3.13/3.14 jobs. Local reproduction with PYTHONPATH unset produced the same **28 ModuleNotFoundError collection errors**, with only 39 tests collected.
+
+The cause was test-package layout: `tests/__init__.py` and existing runtime/execution package markers were present, but the four new accounting directories lacked `__init__.py`. Alphabetical discovery entered `tests/golden/accounting` first as a non-package; its `tests.*` helper import resolved before pytest established the repository test package. This was a reproducible collection defect, not an inherent console-entry-point environment limitation.
+
+The smallest convention-consistent repair adds docstring-only package markers:
+
+- `tests/unit/accounting/__init__.py`
+- `tests/property/accounting/__init__.py`
+- `tests/integration/accounting/__init__.py`
+- `tests/golden/accounting/__init__.py`
+
+No production, dependency, pyproject, lockfile, CI configuration, sys.path mutation, or PYTHONPATH fallback was introduced.
+
+Exact console-entry-point evidence (native existing Python 3.14, workspace-local UV cache, PYTHONPATH explicitly removed):
+
+```powershell
+Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+if (Test-Path Env:PYTHONPATH) { throw 'PYTHONPATH must be unset for console validation' }
+$env:UV_CACHE_DIR = Join-Path (Get-Location) '.uv-cache'
+uv run pytest --collect-only -q -p no:cacheprovider
+$collectionRepairTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('ccs-phase009-console-' + [guid]::NewGuid().ToString('N'))
+uv run pytest tests/test_package_smoke.py tests/unit/accounting tests/property/accounting tests/integration/accounting tests/golden/accounting tests/integration/execution/test_runtime_execution.py tests/golden/execution/test_reference_scenarios.py -q -p no:cacheprovider --basetemp=$collectionRepairTemp
+```
+
+Results: **290 tests collected in 0.67s with no errors; 74 passed in 2.23s**. The focused execution used a fresh unique OS-temp basetemp and needed no escalation. Four added marker files passed focused Ruff format/lint and strict mypy; `git diff --check` passed.
+
+Independent full acceptance and renewed Python 3.13/3.14 CI remain separate gates. No publication was performed by the implementation owner. The default-cache and unrelated historical temp/format scan environment ledger entries remain unchanged; the `tests.*` console collection defect is repaired by the test-package change above.

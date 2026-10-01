@@ -1,0 +1,1 @@
+"""Accounting property test package."""
