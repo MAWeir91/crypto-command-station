@@ -27,6 +27,13 @@ from command_station.execution import (
 )
 from command_station.market_data.datasets import canonical_json
 from command_station.market_data.replay import BarReference, HistoricalReplayFeed, MarketReplayBatch
+from command_station.risk import (
+    RiskActivationResult,
+    RiskDecisionStatus,
+    RiskEngine,
+    RiskOrderBinding,
+    RiskStateSnapshot,
+)
 from command_station.runtime.clock import SimulatedClock
 from command_station.runtime.events import RuntimeEventKind, RuntimeTraceEvent
 from command_station.runtime.market import MarketView, _MarketState
@@ -76,6 +83,8 @@ class ReferenceRuntimeResult:
     final_account_view: AccountView | None = None
     final_positions: tuple[PositionView, ...] = ()
     final_portfolio_snapshot: PortfolioSnapshot | None = None
+    risk_decision_count: int = 0
+    risk_fingerprint: str | None = None
 
 
 class ReferenceTradingRuntime:
@@ -86,6 +95,7 @@ class ReferenceTradingRuntime:
         market_feed: HistoricalReplayFeed,
         broker: SimulatedBroker | None = None,
         accounting: SpotAccountingEngine | None = None,
+        risk: RiskEngine | None = None,
     ) -> None:
         if not isinstance(clock, SimulatedClock) or not isinstance(
             market_feed, HistoricalReplayFeed
@@ -124,6 +134,14 @@ class ReferenceTradingRuntime:
                 raise InvalidRuntimeConfigurationError(
                     "runtime requires fresh compatible accounting"
                 )
+        if (accounting is None) != (risk is None):
+            raise InvalidRuntimeConfigurationError(
+                "financial runtime requires accounting and risk together"
+            )
+        if risk is not None and (not isinstance(risk, RiskEngine) or risk.decisions):
+            raise InvalidRuntimeConfigurationError("runtime requires fresh RiskEngine")
+        self.risk = risk
+        self._risk_bindings: dict[OrderId, RiskOrderBinding] = {}
         self.accounting = accounting
         self._batches = tuple(market_feed)
         self._cursor = 0
@@ -149,19 +167,14 @@ class ReferenceTradingRuntime:
     def trace_fingerprint(self) -> str:
         return _fingerprint(self.trace_events)
 
+    @property
+    def risk_bindings(self) -> tuple[RiskOrderBinding, ...]:
+        return tuple(self._risk_bindings[oid] for oid in sorted(self._risk_bindings))
+
     def activate_order(
         self, request: NormalizedOrderRequest, *, max_quote_reservation: Decimal | None = None
-    ) -> Order:
-        """Activate at the current safe between-batch runtime boundary."""
-        self._require_order_boundary()
-        accounting = self._require_accounting()
-        self._validate_financial_composition()
-        plan = accounting.prepare_reservation(
-            (request,), max_quote_reservation=max_quote_reservation
-        )
-        order = self.broker.activate(request, self.clock.now)
-        accounting.bind_reservation(plan, (order,), self.clock.now)
-        return order
+    ) -> RiskActivationResult:
+        return self._authorize_and_activate((request,), max_quote_reservation)
 
     def activate_oco(
         self,
@@ -169,17 +182,44 @@ class ReferenceTradingRuntime:
         second: NormalizedOrderRequest,
         *,
         max_quote_reservation: Decimal | None = None,
-    ) -> tuple[Order, Order]:
-        """Activate an exclusive pair at the current safe runtime boundary."""
+    ) -> RiskActivationResult:
+        return self._authorize_and_activate((first, second), max_quote_reservation)
+
+    def _authorize_and_activate(
+        self, requests: tuple[NormalizedOrderRequest, ...], cap: Decimal | None
+    ) -> RiskActivationResult:
         self._require_order_boundary()
         accounting = self._require_accounting()
         self._validate_financial_composition()
-        plan = accounting.prepare_reservation(
-            (first, second), max_quote_reservation=max_quote_reservation
+        assert self.risk is not None
+        state = RiskStateSnapshot(
+            self.clock.now,
+            accounting.spec,
+            accounting.account_view,
+            accounting.positions,
+            accounting.reservations,
+            self.broker.orders,
+            accounting.portfolio_snapshot,
+            accounting.execution_spec,
         )
-        orders = self.broker.activate_oco(first, second, self.clock.now)
+        authorization = self.risk.authorize(state, requests, max_quote_reservation=cap)
+        if authorization.decision.status is RiskDecisionStatus.REJECT:
+            return RiskActivationResult(authorization.decision, ())
+        plan = authorization.reservation_plan
+        approved = authorization.approved_requests
+        assert plan is not None and plan.requests == approved
+        orders: tuple[Order, ...]
+        if len(approved) == 1:
+            orders = (self.broker.activate(approved[0], self.clock.now),)
+        else:
+            orders = self.broker.activate_oco(approved[0], approved[1], self.clock.now)
         accounting.bind_reservation(plan, orders, self.clock.now)
-        return orders
+        for request, order in zip(approved, orders, strict=True):
+            reservation = next(r for r in accounting.reservations if order.order_id in r.order_ids)
+            self._risk_bindings[order.order_id] = RiskOrderBinding(
+                authorization.decision, request, order, reservation.reservation_id
+            )
+        return RiskActivationResult(authorization.decision, orders)
 
     def cancel_order(
         self,
@@ -279,6 +319,8 @@ class ReferenceTradingRuntime:
             self.accounting.account_view if self.accounting else None,
             self.accounting.positions if self.accounting else (),
             self.accounting.portfolio_snapshot if self.accounting else None,
+            len(self.risk.decisions) if self.risk else 0,
+            self.risk.risk_fingerprint if self.risk else None,
         )
 
     def _process(self, batch: MarketReplayBatch) -> RuntimeStepResult:
@@ -336,6 +378,55 @@ class ReferenceTradingRuntime:
                 raise RuntimeEngineError("broker/accounting execution specification changed")
             if self.broker.fills != self.accounting.applied_fills:
                 raise RuntimeEngineError("broker contains unaccounted Fill facts")
+            if self.risk is None:
+                raise RuntimeEngineError("financial runtime lost risk authority")
+            for order in self.broker.orders:
+                binding = self._risk_bindings.get(order.order_id)
+                if binding is None:
+                    raise RuntimeEngineError("broker order has no risk authorization")
+                decision, request, original = (
+                    binding.decision,
+                    binding.approved_request,
+                    binding.original_order,
+                )
+                if (
+                    decision not in self.risk.decisions
+                    or decision.status is RiskDecisionStatus.REJECT
+                ):
+                    raise RuntimeEngineError("broker order lost risk decision")
+                reservation = next(
+                    (
+                        r
+                        for r in self.accounting.reservations
+                        if r.reservation_id == binding.reservation_id
+                    ),
+                    None,
+                )
+                if reservation is None or order.order_id not in reservation.order_ids:
+                    raise RuntimeEngineError("risk reservation/order binding mismatch")
+                names = (
+                    "product_id",
+                    "base_currency",
+                    "quote_currency",
+                    "side",
+                    "order_type",
+                    "requested_base_quantity",
+                    "activated_base_quantity",
+                    "limit_price",
+                    "stop_price",
+                    "created_at",
+                    "activated_at",
+                    "product_spec_fingerprint",
+                    "oco_group_id",
+                )
+                if any(getattr(order, name) != getattr(original, name) for name in names):
+                    raise RuntimeEngineError("broker order differs from authorized activation")
+                if (
+                    original.activated_base_quantity != request.normalized_base_quantity
+                    or original.product_id != decision.product_id
+                    or original.activated_at != decision.timestamp
+                ):
+                    raise RuntimeEngineError("risk request/order binding mismatch")
             self.accounting.validate_boundary(self.clock.now, self.broker.orders)
 
     def _require_order_boundary(self) -> None:

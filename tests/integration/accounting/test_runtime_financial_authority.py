@@ -5,13 +5,13 @@ import pytest
 
 from command_station.accounting import (
     USD,
-    InsufficientAvailableBalanceError,
     SpotAccountingEngine,
     SpotAccountSpec,
 )
 from command_station.domain import ProductId, Side, Timeframe
 from command_station.execution import OrderType, SimulatedBroker
 from command_station.market_data.replay import HistoricalReplayFeed
+from command_station.risk import RiskEngine
 from command_station.runtime import (
     InvalidRuntimeConfigurationError,
     ReferenceTradingRuntime,
@@ -35,6 +35,7 @@ def runtime(
         market_feed=feed,
         broker=SimulatedBroker(accounting.execution_spec),
         accounting=accounting,
+        risk=RiskEngine(),
     )
 
 
@@ -80,8 +81,8 @@ def test_insufficient_activation_does_not_mutate_broker_or_account() -> None:
     rt = runtime(cash="10")
     assert rt.accounting is not None
     before = rt.broker.execution_fingerprint, rt.accounting.accounting_fingerprint
-    with pytest.raises(InsufficientAvailableBalanceError):
-        rt.activate_order(request(), max_quote_reservation=Decimal(11))
+    result = rt.activate_order(request(), max_quote_reservation=Decimal(11))
+    assert result.decision.status.value == "REJECT" and result.orders == ()
     assert (rt.broker.execution_fingerprint, rt.accounting.accounting_fingerprint) == before
 
 
@@ -107,7 +108,7 @@ def test_cancel_releases_availability_without_totals_or_lots() -> None:
     before = rt.accounting.account_view, rt.accounting.positions, rt.accounting.lots
     order = rt.activate_order(request(kind=OrderType.LIMIT, price="0.01"))
     assert rt.accounting.account_view.balance(USD).reserved > 0
-    rt.cancel_order(order.order_id)
+    rt.cancel_order(order.orders[0].order_id)
     assert (rt.accounting.account_view, rt.accounting.positions, rt.accounting.lots) == before
     assert rt.run().fill_count == 0
 
@@ -134,10 +135,11 @@ def test_oco_single_peer_cancel_rejects_and_whole_group_restores_availability() 
     rt = runtime(holding="2")
     assert rt.accounting is not None
     before = rt.accounting.account_view, rt.accounting.lots, rt.accounting.positions
-    target, stop = rt.activate_oco(
+    activation = rt.activate_oco(
         request(Side.SELL, OrderType.LIMIT, price="100"),
         request(Side.SELL, OrderType.STOP_MARKET, price="0.01"),
     )
+    target, stop = activation.orders
     fingerprint = rt.broker.execution_fingerprint, rt.accounting.accounting_fingerprint
     with pytest.raises(RuntimeEngineError):
         rt.cancel_order(target.order_id)
@@ -209,7 +211,7 @@ def test_multi_product_settlement_and_fresh_run_identity() -> None:
         )
         engine = SpotAccountingEngine(spec, feed.start)
         rt = ReferenceTradingRuntime(
-            clock=SimulatedClock(feed.start), market_feed=feed, accounting=engine
+            clock=SimulatedClock(feed.start), market_feed=feed, accounting=engine, risk=RiskEngine()
         )
         from command_station.execution import normalize_order_intent
 

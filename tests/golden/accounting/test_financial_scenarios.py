@@ -3,6 +3,7 @@ from decimal import Decimal
 from command_station.accounting import USD, LedgerCategory
 from command_station.domain import Side
 from command_station.execution import OrderType, SimulatedBroker
+from command_station.risk import RiskEngine
 from tests.accounting_fixtures import account, request, reserve
 from tests.execution_fixtures import candle, timestamp
 
@@ -90,6 +91,7 @@ def test_existing_stop_and_oco_settle_golden_before_publication() -> None:
             market_feed=feed,
             broker=SimulatedBroker(engine.execution_spec),
             accounting=engine,
+            risk=RiskEngine(),
         )
         rt.step()
         stop = request(Side.SELL, OrderType.STOP_MARKET, price="95", minute=1)

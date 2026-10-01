@@ -22,9 +22,9 @@ def test_future_external_cancellation_rejected_before_execution_or_release(oco: 
             request(kind=OrderType.LIMIT),
             request(kind=OrderType.STOP_MARKET),
             max_quote_reservation=Decimal(100),
-        )
+        ).orders
     else:
-        orders = (rt.activate_order(request(), max_quote_reservation=Decimal(100)),)
+        orders = rt.activate_order(request(), max_quote_reservation=Decimal(100)).orders
     assert rt.accounting is not None
     before = rt.accounting.accounting_fingerprint
     for order in orders:

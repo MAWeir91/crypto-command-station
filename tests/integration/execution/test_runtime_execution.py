@@ -16,6 +16,7 @@ from command_station.execution import (
 )
 from command_station.market_data.datasets import CanonicalCandleDataset
 from command_station.market_data.replay import HistoricalReplayFeed
+from command_station.risk import RiskEngine
 from command_station.runtime import (
     ReferenceRuntimeResult,
     ReferenceTradingRuntime,
@@ -151,7 +152,7 @@ def test_runtime_limit_persists_until_a_later_interval_touches() -> None:
     touched = runtime.step()
     assert touched is not None and len(touched.fills) == 1
     fill = touched.fills[0]
-    assert fill.order_id == order.order_id
+    assert fill.order_id == order.orders[0].order_id
     assert fill.fill_price == 105
     assert fill.resolution is ExecutionResolution.PRICE_CROSSED
     assert fill.market_interval_open == source.candles[2].open_time
@@ -177,7 +178,7 @@ def test_runtime_cancellation_prevents_later_limit_fill_and_is_fingerprinted() -
     assert runtime.broker.orders[0].status is OrderStatus.ACTIVE
     before_cancel = runtime.broker.execution_fingerprint
 
-    cancelled = runtime.cancel_order(activated.order_id, CancellationReason.USER_REQUEST)
+    cancelled = runtime.cancel_order(activated.orders[0].order_id, CancellationReason.USER_REQUEST)
     assert cancelled.status is OrderStatus.CANCELLED
     later = runtime.step()
     assert later is not None and later.fills == ()
@@ -194,7 +195,7 @@ def test_runtime_oco_ambiguity_fills_conservatively_before_publication() -> None
     runtime.step()
     target = _request(runtime, side=Side.SELL, order_type=OrderType.LIMIT, limit_price="105")
     stop = _request(runtime, side=Side.SELL, order_type=OrderType.STOP_MARKET, stop_price="95")
-    first, second = runtime.activate_oco(target, stop)
+    first, second = runtime.activate_oco(target, stop).orders
 
     result = runtime.step()
     assert result is not None and len(result.fills) == 1
@@ -253,5 +254,5 @@ def _funded_runtime(feed: HistoricalReplayFeed) -> ReferenceTradingRuntime:
         feed.start,
     )
     return ReferenceTradingRuntime(
-        clock=SimulatedClock(feed.start), market_feed=feed, accounting=account
+        clock=SimulatedClock(feed.start), market_feed=feed, accounting=account, risk=RiskEngine()
     )

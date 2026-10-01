@@ -14,6 +14,7 @@ from command_station.execution import (
     normalize_order_intent,
 )
 from command_station.market_data.replay import HistoricalReplayFeed
+from command_station.risk import RiskEngine
 from command_station.runtime import ReferenceTradingRuntime, RuntimeEventKind, SimulatedClock
 from tests.execution_fixtures import candle, product, timestamp
 from tests.runtime_fixtures import canonical
@@ -101,6 +102,7 @@ def test_existing_stop_executes_before_bar_publication_golden() -> None:
     runtime = ReferenceTradingRuntime(
         clock=SimulatedClock(feed.start),
         market_feed=feed,
+        risk=RiskEngine(),
         accounting=SpotAccountingEngine(
             SpotAccountSpec(
                 initial_cash="1000",
