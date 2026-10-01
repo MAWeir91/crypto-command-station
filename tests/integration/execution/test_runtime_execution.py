@@ -1,8 +1,25 @@
 from command_station.domain import ProductId, Side
-from command_station.execution import BaseQuantity, OrderIntent, OrderType, normalize_order_intent
+from command_station.execution import (
+    BaseQuantity,
+    CancellationReason,
+    ExecutionResolution,
+    Fill,
+    NormalizedOrderRequest,
+    Order,
+    OrderIntent,
+    OrderStatus,
+    OrderType,
+    normalize_order_intent,
+)
+from command_station.market_data.datasets import CanonicalCandleDataset
 from command_station.market_data.replay import HistoricalReplayFeed
-from command_station.runtime import ReferenceTradingRuntime, RuntimeEventKind, SimulatedClock
-from tests.execution_fixtures import product
+from command_station.runtime import (
+    ReferenceRuntimeResult,
+    ReferenceTradingRuntime,
+    RuntimeEventKind,
+    SimulatedClock,
+)
+from tests.execution_fixtures import candle, product
 from tests.runtime_fixtures import canonical
 
 
@@ -58,3 +75,161 @@ def test_multi_product_interval_order_does_not_change_execution() -> None:
                 )
             )
     assert first.run().execution_fingerprint == second.run().execution_fingerprint
+
+
+def _runtime_with_prices(
+    prices: tuple[tuple[str, str, str, str], ...],
+) -> tuple[CanonicalCandleDataset, ReferenceTradingRuntime]:
+    """Build a real replay/runtime composition with explicit OHLC intervals."""
+    source = canonical("BTC-USD", minutes=len(prices))
+    source = CanonicalCandleDataset(
+        product_id=source.product_id,
+        start=source.start,
+        end=source.end,
+        as_of=source.as_of,
+        gaps=source.gaps,
+        source_pages=source.source_pages,
+        candles=tuple(
+            candle(
+                minute,
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+            )
+            for minute, (open_price, high, low, close) in enumerate(prices)
+        ),
+    )
+    feed = HistoricalReplayFeed((source,))
+    return source, ReferenceTradingRuntime(clock=SimulatedClock(feed.start), market_feed=feed)
+
+
+def _request(
+    runtime: ReferenceTradingRuntime,
+    *,
+    side: Side,
+    order_type: OrderType,
+    limit_price: str | None = None,
+    stop_price: str | None = None,
+) -> NormalizedOrderRequest:
+    return normalize_order_intent(
+        OrderIntent(
+            product_id=ProductId("BTC-USD"),
+            side=side,
+            order_type=order_type,
+            base_quantity=BaseQuantity("1"),
+            created_at=runtime.clock.now,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        ),
+        product(),
+    )
+
+
+def test_runtime_limit_persists_until_a_later_interval_touches() -> None:
+    source, runtime = _runtime_with_prices(
+        (
+            ("100", "101", "99", "100"),
+            ("100", "102", "99", "101"),
+            ("101", "106", "100", "105"),
+            ("105", "106", "104", "105"),
+        )
+    )
+    runtime.step()
+    order = runtime.activate_order(
+        _request(runtime, side=Side.SELL, order_type=OrderType.LIMIT, limit_price="105")
+    )
+
+    untouched = runtime.step()
+    assert untouched is not None and untouched.fills == ()
+    assert runtime.broker.orders[0].status is OrderStatus.ACTIVE
+
+    touched = runtime.step()
+    assert touched is not None and len(touched.fills) == 1
+    fill = touched.fills[0]
+    assert fill.order_id == order.order_id
+    assert fill.fill_price == 105
+    assert fill.resolution is ExecutionResolution.PRICE_CROSSED
+    assert fill.market_interval_open == source.candles[2].open_time
+    assert fill.activated_at <= fill.market_interval_open
+    assert runtime.broker.orders[0].status.value == "FILLED"
+
+
+def test_runtime_cancellation_prevents_later_limit_fill_and_is_fingerprinted() -> None:
+    _, runtime = _runtime_with_prices(
+        (
+            ("100", "101", "99", "100"),
+            ("100", "102", "99", "101"),
+            ("101", "106", "100", "105"),
+            ("105", "106", "104", "105"),
+        )
+    )
+    runtime.step()
+    activated = runtime.activate_order(
+        _request(runtime, side=Side.SELL, order_type=OrderType.LIMIT, limit_price="105")
+    )
+    untouched = runtime.step()
+    assert untouched is not None and untouched.fills == ()
+    assert runtime.broker.orders[0].status is OrderStatus.ACTIVE
+    before_cancel = runtime.broker.execution_fingerprint
+
+    cancelled = runtime.cancel_order(activated.order_id, CancellationReason.USER_REQUEST)
+    assert cancelled.status is OrderStatus.CANCELLED
+    later = runtime.step()
+    assert later is not None and later.fills == ()
+    final = runtime.broker.orders[0]
+    assert final.status is OrderStatus.CANCELLED
+    assert final.cancellation_reason is CancellationReason.USER_REQUEST
+    assert runtime.broker.execution_fingerprint != before_cancel
+
+
+def test_runtime_oco_ambiguity_fills_conservatively_before_publication() -> None:
+    _, runtime = _runtime_with_prices(
+        (("100", "101", "99", "100"), ("100", "110", "90", "100"), ("100", "101", "99", "100"))
+    )
+    runtime.step()
+    target = _request(runtime, side=Side.SELL, order_type=OrderType.LIMIT, limit_price="105")
+    stop = _request(runtime, side=Side.SELL, order_type=OrderType.STOP_MARKET, stop_price="95")
+    first, second = runtime.activate_oco(target, stop)
+
+    result = runtime.step()
+    assert result is not None and len(result.fills) == 1
+    fill = result.fills[0]
+    assert fill.order_id == second.order_id
+    assert fill.fill_price == 95
+    assert fill.resolution is ExecutionResolution.AMBIGUOUS_CONSERVATIVE
+    assert fill.ambiguity is True
+    assert fill.activated_at <= fill.market_interval_open
+    snapshots = {order.order_id: order for order in runtime.broker.orders}
+    assert snapshots[second.order_id].status is OrderStatus.FILLED
+    assert snapshots[first.order_id].status is OrderStatus.CANCELLED
+    assert snapshots[first.order_id].cancellation_reason is CancellationReason.OCO_PEER_FILLED
+    kinds = [event.kind for event in result.trace_events]
+    assert kinds.index(RuntimeEventKind.EXECUTION_PROCESSED) < kinds.index(
+        RuntimeEventKind.BARS_PUBLISHED
+    )
+    assert runtime.step() is not None
+    assert len(runtime.broker.fills) == 1
+
+
+def test_fresh_equivalent_runtime_compositions_have_identical_execution() -> None:
+    def execute() -> tuple[ReferenceRuntimeResult, tuple[Fill, ...], tuple[Order, ...], str]:
+        _, runtime = _runtime_with_prices(
+            (
+                ("100", "101", "99", "100"),
+                ("101", "102", "100", "101"),
+                ("102", "103", "101", "102"),
+            )
+        )
+        runtime.step()
+        runtime.activate_order(_request(runtime, side=Side.BUY, order_type=OrderType.MARKET))
+        result = runtime.run()
+        return result, runtime.broker.fills, runtime.broker.orders, runtime.trace_fingerprint
+
+    first = execute()
+    second = execute()
+    assert len(first[1]) == 1
+    assert first[1] == second[1]
+    assert first[0].execution_fingerprint == second[0].execution_fingerprint
+    assert first[2] == second[2]
+    assert first[3] == second[3]
