@@ -20,6 +20,7 @@ def test_golden_visibility_and_exact_stage_order() -> None:
     assert [event.kind for event in first.trace_events] == [
         RuntimeEventKind.CLOCK_ADVANCED,
         RuntimeEventKind.MARKET_ACTIVITY,
+        RuntimeEventKind.EXECUTION_PROCESSED,
         RuntimeEventKind.BARS_PUBLISHED,
         RuntimeEventKind.MARKET_STATE_READY,
     ]

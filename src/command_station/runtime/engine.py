@@ -7,6 +7,14 @@ from enum import StrEnum
 from hashlib import sha256
 
 from command_station.domain import UtcTimestamp
+from command_station.execution import (
+    CancellationReason,
+    Fill,
+    NormalizedOrderRequest,
+    Order,
+    OrderId,
+    SimulatedBroker,
+)
 from command_station.market_data.datasets import canonical_json
 from command_station.market_data.replay import BarReference, HistoricalReplayFeed, MarketReplayBatch
 from command_station.runtime.clock import SimulatedClock
@@ -34,6 +42,7 @@ class RuntimeStepResult:
     timestamp: UtcTimestamp
     execution_intervals: tuple[BarReference, ...]
     published_bars: tuple[BarReference, ...]
+    fills: tuple[Fill, ...]
     trace_events: tuple[RuntimeTraceEvent, ...]
 
 
@@ -44,12 +53,20 @@ class ReferenceRuntimeResult:
     final_clock: UtcTimestamp
     batch_count: int
     published_bar_count: int
+    fill_count: int
     trace_events: tuple[RuntimeTraceEvent, ...]
     trace_fingerprint: str
+    execution_fingerprint: str
 
 
 class ReferenceTradingRuntime:
-    def __init__(self, *, clock: SimulatedClock, market_feed: HistoricalReplayFeed) -> None:
+    def __init__(
+        self,
+        *,
+        clock: SimulatedClock,
+        market_feed: HistoricalReplayFeed,
+        broker: SimulatedBroker | None = None,
+    ) -> None:
         if not isinstance(clock, SimulatedClock) or not isinstance(
             market_feed, HistoricalReplayFeed
         ):
@@ -58,7 +75,10 @@ class ReferenceTradingRuntime:
             )
         if clock.now != market_feed.start:
             raise InvalidRuntimeConfigurationError("clock must start at replay feed start")
+        if broker is not None and not isinstance(broker, SimulatedBroker):
+            raise InvalidRuntimeConfigurationError("runtime broker must be SimulatedBroker")
         self.clock, self.market_feed = clock, market_feed
+        self.broker = broker if broker is not None else SimulatedBroker()
         self._batches = tuple(market_feed)
         self._cursor = 0
         self._state = _MarketState.create()
@@ -82,6 +102,27 @@ class ReferenceTradingRuntime:
     @property
     def trace_fingerprint(self) -> str:
         return _fingerprint(self.trace_events)
+
+    def activate_order(self, request: NormalizedOrderRequest) -> Order:
+        """Activate at the current safe between-batch runtime boundary."""
+        self._require_order_boundary()
+        return self.broker.activate(request, self.clock.now)
+
+    def activate_oco(
+        self, first: NormalizedOrderRequest, second: NormalizedOrderRequest
+    ) -> tuple[Order, Order]:
+        """Activate an exclusive pair at the current safe runtime boundary."""
+        self._require_order_boundary()
+        return self.broker.activate_oco(first, second, self.clock.now)
+
+    def cancel_order(
+        self,
+        order_id: OrderId,
+        reason: CancellationReason = CancellationReason.USER_REQUEST,
+    ) -> Order:
+        """Cancel an active order at the current safe runtime boundary."""
+        self._require_order_boundary()
+        return self.broker.cancel(order_id, self.clock.now, reason)
 
     def step(self) -> RuntimeStepResult | None:
         if self._lifecycle is RuntimeLifecycle.COMPLETED:
@@ -118,8 +159,10 @@ class ReferenceTradingRuntime:
             self.clock.now,
             self._cursor,
             self._published_count,
+            len(self.broker.fills),
             self.trace_events,
             self.trace_fingerprint,
+            self.broker.execution_fingerprint,
         )
 
     def _process(self, batch: MarketReplayBatch) -> RuntimeStepResult:
@@ -130,6 +173,10 @@ class ReferenceTradingRuntime:
             BarReference.from_candle(value) for value in batch.execution_intervals
         )
         events.append(self._emit(RuntimeEventKind.MARKET_ACTIVITY, batch.timestamp, execution_refs))
+        fills = self.broker.process_market_activity(batch.execution_intervals, batch.timestamp)
+        events.append(
+            self._emit(RuntimeEventKind.EXECUTION_PROCESSED, batch.timestamp, execution_refs)
+        )
         published_refs = tuple(BarReference.from_candle(value) for value in batch.closing_bars)
         self._state.publish(batch.timestamp, batch.closing_bars)
         self._published_count += len(batch.closing_bars)
@@ -137,7 +184,13 @@ class ReferenceTradingRuntime:
         events.append(
             self._emit(RuntimeEventKind.MARKET_STATE_READY, batch.timestamp, published_refs)
         )
-        return RuntimeStepResult(batch.timestamp, execution_refs, published_refs, tuple(events))
+        return RuntimeStepResult(
+            batch.timestamp, execution_refs, published_refs, fills, tuple(events)
+        )
+
+    def _require_order_boundary(self) -> None:
+        if self._lifecycle in (RuntimeLifecycle.COMPLETED, RuntimeLifecycle.FAILED):
+            raise RuntimeEngineError("orders cannot change after runtime termination")
 
     def _complete(self) -> None:
         if self._lifecycle is RuntimeLifecycle.RUNNING:

@@ -54,6 +54,7 @@ def test_step_keeps_market_activity_before_atomic_publication() -> None:
     assert [event.kind for event in step.trace_events] == [
         RuntimeEventKind.CLOCK_ADVANCED,
         RuntimeEventKind.MARKET_ACTIVITY,
+        RuntimeEventKind.EXECUTION_PROCESSED,
         RuntimeEventKind.BARS_PUBLISHED,
         RuntimeEventKind.MARKET_STATE_READY,
     ]
