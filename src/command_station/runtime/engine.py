@@ -14,7 +14,7 @@ from command_station.accounting import (
     PositionView,
     SpotAccountingEngine,
 )
-from command_station.domain import UtcTimestamp
+from command_station.domain import Side, UtcTimestamp, require_positive
 from command_station.execution import (
     CancellationReason,
     Fill,
@@ -23,7 +23,9 @@ from command_station.execution import (
     Order,
     OrderId,
     OrderStatus,
+    OrderType,
     SimulatedBroker,
+    normalize_order_intent,
 )
 from command_station.market_data.datasets import canonical_json
 from command_station.market_data.replay import BarReference, HistoricalReplayFeed, MarketReplayBatch
@@ -37,6 +39,18 @@ from command_station.risk import (
 from command_station.runtime.clock import SimulatedClock
 from command_station.runtime.events import RuntimeEventKind, RuntimeTraceEvent
 from command_station.runtime.market import MarketView, _MarketState
+from command_station.strategy import (
+    StrategyActionResult,
+    StrategyActionStatus,
+    StrategyClockView,
+    StrategyCommandKind,
+    StrategyContext,
+    StrategyContractError,
+    StrategyMarketView,
+    StrategyOrderCommand,
+    StrategyOrderView,
+    StrategyRunner,
+)
 
 
 class InvalidRuntimeConfigurationError(ValueError):
@@ -85,6 +99,7 @@ class ReferenceRuntimeResult:
     final_portfolio_snapshot: PortfolioSnapshot | None = None
     risk_decision_count: int = 0
     risk_fingerprint: str | None = None
+    strategy_fingerprint: str | None = None
 
 
 class ReferenceTradingRuntime:
@@ -96,6 +111,7 @@ class ReferenceTradingRuntime:
         broker: SimulatedBroker | None = None,
         accounting: SpotAccountingEngine | None = None,
         risk: RiskEngine | None = None,
+        strategy_runner: StrategyRunner | None = None,
     ) -> None:
         if not isinstance(clock, SimulatedClock) or not isinstance(
             market_feed, HistoricalReplayFeed
@@ -149,6 +165,9 @@ class ReferenceTradingRuntime:
         self._trace: list[RuntimeTraceEvent] = []
         self._lifecycle = RuntimeLifecycle.CREATED
         self._published_count = 0
+        self.strategy_runner = strategy_runner
+        if strategy_runner is not None:
+            self._preflight_strategy()
 
     @property
     def lifecycle(self) -> RuntimeLifecycle:
@@ -174,6 +193,7 @@ class ReferenceTradingRuntime:
     def activate_order(
         self, request: NormalizedOrderRequest, *, max_quote_reservation: Decimal | None = None
     ) -> RiskActivationResult:
+        self._require_manual_orders()
         return self._authorize_and_activate((request,), max_quote_reservation)
 
     def activate_oco(
@@ -183,6 +203,7 @@ class ReferenceTradingRuntime:
         *,
         max_quote_reservation: Decimal | None = None,
     ) -> RiskActivationResult:
+        self._require_manual_orders()
         return self._authorize_and_activate((first, second), max_quote_reservation)
 
     def _authorize_and_activate(
@@ -227,6 +248,10 @@ class ReferenceTradingRuntime:
         reason: CancellationReason = CancellationReason.USER_REQUEST,
     ) -> Order:
         """Cancel an active order at the current safe runtime boundary."""
+        self._require_manual_orders()
+        return self._cancel_order(order_id, reason)
+
+    def _cancel_order(self, order_id: OrderId, reason: CancellationReason) -> Order:
         self._require_order_boundary()
         accounting = self._require_accounting()
         self._validate_financial_composition()
@@ -244,6 +269,10 @@ class ReferenceTradingRuntime:
         self, group_id: OcoGroupId, reason: CancellationReason = CancellationReason.USER_REQUEST
     ) -> tuple[Order, Order]:
         """Cancel both exclusive peers together; never leave a one-peer OCO."""
+        self._require_manual_orders()
+        return self._cancel_oco(group_id, reason)
+
+    def _cancel_oco(self, group_id: OcoGroupId, reason: CancellationReason) -> tuple[Order, Order]:
         self._require_order_boundary()
         accounting = self._require_accounting()
         self._validate_financial_composition()
@@ -289,14 +318,16 @@ class ReferenceTradingRuntime:
         batch = self._batches[self._cursor]
         try:
             result = self._process(batch)
+            self._cursor += 1
+            if self._cursor == len(self._batches):
+                self._complete()
         except Exception as error:
             self._lifecycle = RuntimeLifecycle.FAILED
+            if self.strategy_runner is not None:
+                self.strategy_runner.failed = True
             if isinstance(error, RuntimeEngineError):
                 raise
             raise RuntimeEngineError("reference runtime batch processing failed") from error
-        self._cursor += 1
-        if self._cursor == len(self._batches):
-            self._complete()
         return result
 
     def run(self) -> ReferenceRuntimeResult:
@@ -321,6 +352,7 @@ class ReferenceTradingRuntime:
             self.accounting.portfolio_snapshot if self.accounting else None,
             len(self.risk.decisions) if self.risk else 0,
             self.risk.risk_fingerprint if self.risk else None,
+            self.strategy_runner.fingerprint if self.strategy_runner else None,
         )
 
     def _process(self, batch: MarketReplayBatch) -> RuntimeStepResult:
@@ -349,9 +381,45 @@ class ReferenceTradingRuntime:
         self._state.publish(batch.timestamp, batch.closing_bars)
         self._published_count += len(batch.closing_bars)
         events.append(self._emit(RuntimeEventKind.BARS_PUBLISHED, batch.timestamp, published_refs))
+        runner = self.strategy_runner
+        if runner is not None:
+            runner.indicators.update(batch.closing_bars, batch.timestamp)
+            events.append(self._emit(RuntimeEventKind.INDICATORS_UPDATED, batch.timestamp))
+            if runner.started:
+                for fill in sorted(fills, key=lambda fill: fill.fill_id):
+                    runner._invoke("on_fill", self._strategy_context(False), fill=fill)
+            elif fills:
+                raise RuntimeEngineError("strategy fills cannot occur before trading start")
+            events.append(self._emit(RuntimeEventKind.FILL_CALLBACKS_PROCESSED, batch.timestamp))
         events.append(
             self._emit(RuntimeEventKind.MARKET_STATE_READY, batch.timestamp, published_refs)
         )
+        if runner is not None and batch.timestamp >= runner.trading_start:
+            if not runner.started:
+                commands = runner._invoke("on_start", self._strategy_context(True))
+                events.append(self._emit(RuntimeEventKind.STRATEGY_STARTED, batch.timestamp))
+                self._process_strategy_commands(commands)
+                events.append(
+                    self._emit(RuntimeEventKind.STRATEGY_COMMANDS_PROCESSED, batch.timestamp)
+                )
+            primary = runner.definition.primary
+            bar = next(
+                (
+                    bar
+                    for bar in batch.closing_bars
+                    if (bar.product_id, bar.timeframe) == primary.key
+                ),
+                None,
+            )
+            if bar is not None:
+                commands = runner._invoke("on_bar", self._strategy_context(True), bar=bar)
+                events.append(
+                    self._emit(RuntimeEventKind.STRATEGY_DECISION_PROCESSED, batch.timestamp)
+                )
+                self._process_strategy_commands(commands)
+                events.append(
+                    self._emit(RuntimeEventKind.STRATEGY_COMMANDS_PROCESSED, batch.timestamp)
+                )
         return RuntimeStepResult(
             batch.timestamp,
             execution_refs,
@@ -381,6 +449,11 @@ class ReferenceTradingRuntime:
             if self.risk is None:
                 raise RuntimeEngineError("financial runtime lost risk authority")
             for order in self.broker.orders:
+                if (
+                    self.strategy_runner is not None
+                    and order.order_id not in self.strategy_runner.owned_order_ids
+                ):
+                    raise RuntimeEngineError("broker order has no strategy attribution")
                 binding = self._risk_bindings.get(order.order_id)
                 if binding is None:
                     raise RuntimeEngineError("broker order has no risk authorization")
@@ -435,8 +508,216 @@ class ReferenceTradingRuntime:
 
     def _complete(self) -> None:
         if self._lifecycle is RuntimeLifecycle.RUNNING:
+            if self.strategy_runner is not None:
+                self.strategy_runner._invoke("on_stop", self._strategy_context(False))
+                self._emit(RuntimeEventKind.STRATEGY_STOPPED, self.clock.now)
             self._emit(RuntimeEventKind.RUNTIME_STOPPED, self.clock.now)
             self._lifecycle = RuntimeLifecycle.COMPLETED
+
+    def _require_manual_orders(self) -> None:
+        if self.strategy_runner is not None:
+            raise RuntimeEngineError("strategy runtime accepts only attributed callback commands")
+
+    def _preflight_strategy(self) -> None:
+        runner = self.strategy_runner
+        if not isinstance(runner, StrategyRunner) or self.accounting is None or self.risk is None:
+            raise InvalidRuntimeConfigurationError(
+                "strategy runtime requires runner/accounting/risk"
+            )
+        counts = {sub.key: 0 for sub in runner.definition.subscriptions}
+        primary_at_start = False
+        streams = {
+            (source.product_id, source.timeframe) for source in self.market_feed.canonical_sources
+        }
+        streams.update(
+            (source.product_id, source.target_timeframe)
+            for source in self.market_feed.derived_sources
+        )
+        products = {spec.product_id for spec in self.accounting.spec.product_specs}
+        if (
+            not self.market_feed.start < runner.trading_start <= self.market_feed.end
+            or set(counts) - streams
+            or {sub.product_id for sub in runner.definition.subscriptions} - products
+        ):
+            raise InvalidRuntimeConfigurationError(
+                "strategy subscription/trading start incompatible"
+            )
+        for batch in self._batches:
+            if batch.timestamp > runner.trading_start:
+                break
+            for bar in batch.closing_bars:
+                key = (bar.product_id, bar.timeframe)
+                if key in counts:
+                    counts[key] += 1
+                if batch.timestamp == runner.trading_start and key == runner.definition.primary.key:
+                    primary_at_start = True
+        if (
+            not primary_at_start
+            or any(counts[sub.key] < sub.warmup_bars for sub in runner.definition.subscriptions)
+            or any(
+                counts[(spec.product_id, spec.timeframe)] < spec.period
+                for spec in runner.definition.indicators
+            )
+        ):
+            raise InvalidRuntimeConfigurationError(
+                "trading start lacks primary close/sufficient warmup"
+            )
+        try:
+            runner._attach()
+        except StrategyContractError as error:
+            raise InvalidRuntimeConfigurationError(str(error)) from error
+
+    def _strategy_context(self, commands_allowed: bool) -> StrategyContext:
+        runner = self.strategy_runner
+        assert runner is not None and self.accounting is not None
+        market = self.market_view
+        subscriptions = runner.definition.subscriptions
+        # Copy only subscribed published value tuples, not even the unrestricted MarketView.
+        streams = tuple(
+            (
+                sub.product_id,
+                sub.timeframe,
+                market.recent_bars(sub.product_id, sub.timeframe, self._published_count or 1),
+            )
+            for sub in subscriptions
+        )
+        products = tuple(
+            spec
+            for spec in self.accounting.spec.product_specs
+            if spec.product_id in {sub.product_id for sub in subscriptions}
+        )
+        orders = tuple(
+            order for order in self.broker.orders if order.order_id in runner.owned_order_ids
+        )
+        return StrategyContext(
+            StrategyClockView(self.clock.now),
+            StrategyMarketView(market.visible_through, streams, products),
+            runner.parameters,
+            runner.state,
+            runner.indicators.view,
+            self.accounting.account_view,
+            self.accounting.positions,
+            self.accounting.portfolio_snapshot,
+            StrategyOrderView(
+                self.clock.now,
+                runner._next_command,
+                commands_allowed,
+                orders,
+                runner.action_results,
+            ),
+        )
+
+    def _process_strategy_commands(self, commands: tuple[StrategyOrderCommand, ...]) -> None:
+        """Prevalidate whole callback, then commit sequentially against current financial truth."""
+        runner = self.strategy_runner
+        accounting = self._require_accounting()
+        assert runner is not None
+        prepared: list[tuple[StrategyOrderCommand, tuple[NormalizedOrderRequest, ...]]] = []
+        cancelled_ids: set[OrderId] = set()
+        products = {spec.product_id: spec for spec in accounting.spec.product_specs}
+        subscribed = {sub.product_id for sub in runner.definition.subscriptions}
+        for command in commands:
+            if command.timestamp != self.clock.now:
+                raise StrategyContractError("command timestamp must equal callback time")
+            requests: tuple[NormalizedOrderRequest, ...] = ()
+            if command.kind in (StrategyCommandKind.ENTRY, StrategyCommandKind.OCO):
+                if (
+                    len(command.intents) != (1 if command.kind is StrategyCommandKind.ENTRY else 2)
+                    or command.order_id is not None
+                    or command.group_id is not None
+                ):
+                    raise StrategyContractError("invalid entry shape")
+                if any(
+                    intent.product_id not in subscribed or intent.created_at != self.clock.now
+                    for intent in command.intents
+                ):
+                    raise StrategyContractError("intent product/time outside callback authority")
+                requests = tuple(
+                    normalize_order_intent(intent, products[intent.product_id])
+                    for intent in command.intents
+                )
+                needs_cap = requests[0].side is Side.BUY and (
+                    len(requests) == 2 or requests[0].order_type is not OrderType.LIMIT
+                )
+                if needs_cap != (command.max_quote_reservation is not None):
+                    raise StrategyContractError("invalid command funding cap")
+                if command.max_quote_reservation is not None:
+                    require_positive(command.max_quote_reservation)
+                if len(requests) == 2:
+                    self.broker._validate_oco_requests(requests[0], requests[1])
+                for request in requests:
+                    self.broker._validate_activation(request, self.clock.now)
+            else:
+                if command.intents or command.max_quote_reservation is not None:
+                    raise StrategyContractError("cancellation cannot carry entry fields")
+                peers: tuple[Order, ...]
+                if command.kind is StrategyCommandKind.CANCEL:
+                    if (
+                        command.order_id not in runner.owned_order_ids
+                        or command.group_id is not None
+                    ):
+                        raise StrategyContractError("cancel requires attributed order")
+                    assert command.order_id is not None
+                    peers = (self.broker.get_order(command.order_id),)
+                    if peers[0].oco_group_id is not None:
+                        raise StrategyContractError("cancel OCO as a group")
+                elif command.kind is StrategyCommandKind.CANCEL_OCO:
+                    if command.group_id is None or command.order_id is not None:
+                        raise StrategyContractError("cancel OCO requires group identity")
+                    peers = tuple(
+                        order
+                        for order in self.broker.orders
+                        if order.oco_group_id == command.group_id
+                    )
+                    if len(peers) != 2 or any(
+                        order.order_id not in runner.owned_order_ids for order in peers
+                    ):
+                        raise StrategyContractError("cancel OCO requires attributed peers")
+                else:
+                    raise StrategyContractError("unsupported command")
+                for order in peers:
+                    if order.order_id in cancelled_ids:
+                        raise StrategyContractError("duplicate callback cancellation")
+                    order.cancel(self.clock.now, CancellationReason.USER_REQUEST)
+                    accounting.require_reserved_order(order.order_id)
+                    cancelled_ids.add(order.order_id)
+            prepared.append((command, requests))
+        for command, requests in prepared:
+            if requests:
+                activated = self._authorize_and_activate(requests, command.max_quote_reservation)
+                status = (
+                    StrategyActionStatus.REJECTED
+                    if activated.decision.status is RiskDecisionStatus.REJECT
+                    else StrategyActionStatus.ACTIVATED
+                )
+                result = StrategyActionResult(
+                    command.command_id,
+                    self.clock.now,
+                    command.kind,
+                    status,
+                    activated.decision,
+                    tuple(order.order_id for order in activated.orders),
+                )
+            else:
+                cancelled: tuple[Order, ...]
+                if command.kind is StrategyCommandKind.CANCEL:
+                    assert command.order_id is not None
+                    cancelled = (
+                        self._cancel_order(command.order_id, CancellationReason.USER_REQUEST),
+                    )
+                else:
+                    assert command.group_id is not None
+                    cancelled = self._cancel_oco(command.group_id, CancellationReason.USER_REQUEST)
+                result = StrategyActionResult(
+                    command.command_id,
+                    self.clock.now,
+                    command.kind,
+                    StrategyActionStatus.CANCELLED,
+                    None,
+                    tuple(order.order_id for order in cancelled),
+                    cancelled,
+                )
+            runner._record_result(result)
 
     def _emit(
         self, kind: RuntimeEventKind, timestamp: UtcTimestamp, refs: tuple[BarReference, ...] = ()
