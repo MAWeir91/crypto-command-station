@@ -79,6 +79,8 @@ class HistoricalReplayFeed:
         self,
         canonical_sources: Iterable[CanonicalCandleDataset],
         derived_sources: Iterable[ResampledCandleDataset] = (),
+        *,
+        replay_end: UtcTimestamp | None = None,
     ) -> None:
         canonical = tuple(canonical_sources)
         derived = tuple(derived_sources)
@@ -88,6 +90,15 @@ class HistoricalReplayFeed:
         self._derived = self._validate_derived(derived, self._canonical)
         first = self._canonical[0]
         self.start, self.end, self.as_of = first.start, first.end, first.as_of
+        if replay_end is not None:
+            if (
+                not isinstance(replay_end, UtcTimestamp)
+                or not self.start < replay_end <= self.end
+                or replay_end.value.second != 0
+                or replay_end.value.microsecond != 0
+            ):
+                raise ReplayDataError("replay end must be a covered UTC minute boundary")
+            self.end = replay_end
         self._batches = self._build_batches()
 
     @property
