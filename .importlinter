@@ -1,0 +1,34 @@
+[importlinter]
+root_package = command_station
+include_external_packages = True
+
+[importlinter:contract:1]
+name = production package does not depend on pytest
+type = forbidden
+source_modules = command_station
+forbidden_modules = pytest
+
+[importlinter:contract:2]
+name = domain does not depend on market data
+type = forbidden
+source_modules = command_station.domain
+forbidden_modules = command_station.market_data
+
+[importlinter:contract:3]
+name = strategy has no infrastructure dependency
+type = forbidden
+source_modules = command_station.strategy
+forbidden_modules =
+    command_station.market_data
+    coinbase
+    pyarrow
+    requests
+
+[importlinter:contract:4]
+name = financial engines do not depend on strategy
+type = forbidden
+source_modules =
+    command_station.execution
+    command_station.accounting
+    command_station.risk
+forbidden_modules = command_station.strategy
