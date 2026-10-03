@@ -280,6 +280,32 @@ class LocalBacktestArtifactStore:
         _validate_manifest(manifest)
         self._verify(self.directory(manifest.run_id), manifest)
 
+    def load_manifest(self, run_id: BacktestRunId) -> ArtifactManifest:
+        """Strictly reconstruct and verify a complete immutable bundle."""
+        from command_station.research.spec_codec import strict_json
+
+        path = self.directory(run_id) / "manifest.json"
+        _safe(path)
+        try:
+            if not path.is_file() or path.stat().st_nlink != 1:
+                raise BacktestReproducibilityError("unsafe manifest file")
+            data = path.read_bytes()
+            raw = strict_json(data)
+            manifest = ArtifactManifest(
+                BacktestRunId(raw["run_id"]),
+                raw["result_fingerprint"],
+                tuple(ArtifactRecord(**r) for r in raw["artifacts"]),
+                raw["schema_version"],
+            )
+            if manifest.run_id != run_id or canonical_json(manifest.to_dict()) != data:
+                raise BacktestReproducibilityError("manifest canonical schema/identity mismatch")
+            self.verify(manifest)
+            return manifest
+        except BacktestReproducibilityError:
+            raise
+        except Exception as exc:
+            raise BacktestReproducibilityError("strict manifest load failed") from exc
+
     def _verify(self, directory: Path, expected: ArtifactManifest) -> None:
         _validate_manifest(expected)
         _safe(directory)
