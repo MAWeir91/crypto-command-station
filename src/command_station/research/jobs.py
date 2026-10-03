@@ -87,6 +87,8 @@ class JobView:
     failure_code: str | None
     failure_message: str | None
     created_at: str
+    started_at: str | None
+    finished_at: str | None
 
 
 @dataclass(frozen=True, slots=True)

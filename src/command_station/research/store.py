@@ -51,6 +51,15 @@ def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _timestamp(value: object) -> None:
+    """Require the canonical UTC representation used by operational writes."""
+    if type(value) is not str:
+        raise ResearchStoreError("operational timestamp must be a string")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo != UTC or parsed.isoformat() != value:
+        raise ResearchStoreError("canonical UTC operational timestamp required")
+
+
 @dataclass(frozen=True, slots=True)
 class ResultIndexRecord:
     run_id: BacktestRunId
@@ -116,7 +125,8 @@ _SCHEMA = (
         "rprint TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('PENDING','RUNN"
         "ING','COMPLETED','FAILED','CANCELLED')),attempt_count INTEGER NOT NULL D"
         "EFAULT 0 CHECK(attempt_count>=0),claim_token TEXT,failure_code TEXT,fail"
-        "ure_message TEXT,created_at TEXT NOT NULL,result_fingerprint TEXT,manife"
+        "ure_message TEXT,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT,"
+        "result_fingerprint TEXT,manife"
         "st_fingerprint TEXT,UNIQUE(batch_id,run_id))"
     ),
     (
@@ -275,30 +285,57 @@ class LocalResearchStore:
                 or BatchJobId.derive(batch_id, run_id) != job_id
             ):
                 raise ResearchStoreError("persisted job identity mismatch")
+            state = JobState(row["state"])
+            attempts = row["attempt_count"]
+            started, finished = row["started_at"], row["finished_at"]
+            _timestamp(row["created_at"])
+            for timestamp in (started, finished):
+                if timestamp is not None:
+                    _timestamp(timestamp)
+            if type(attempts) is not int or attempts < 0:
+                raise ResearchStoreError("invalid persisted attempt count")
+            if state == JobState.PENDING:
+                coherent = started is None and finished is None
+            elif state == JobState.CANCELLED:
+                coherent = started is None and finished is not None
+            else:
+                coherent = (
+                    attempts > 0
+                    and started is not None
+                    and (finished is None if state == JobState.RUNNING else finished is not None)
+                )
+            if not coherent:
+                raise ResearchStoreError("job state and current-attempt timestamps disagree")
             return JobView(
                 job_id,
                 batch_id,
                 run_id,
                 spec,
                 engine,
-                JobState(row["state"]),
-                row["attempt_count"],
+                state,
+                attempts,
                 row["failure_code"],
                 row["failure_message"],
                 row["created_at"],
+                started,
+                finished,
             )
         except Exception as exc:
             raise ResearchStoreError("invalid persisted job") from exc
 
     def get_job(self, job_id: BatchJobId) -> JobView:
         with self._connection() as db:
-            row = db.execute(
-                "SELECT j.*,b.engine FROM jobs j JOIN batches b USING(batch_id) WHERE job_id=?",
-                (job_id.value,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(job_id)
-            return self._job(row, self._engine(row["engine"]))
+            return self._current_job(db, job_id)
+
+    def _current_job(self, db: sqlite3.Connection, job_id: BatchJobId) -> JobView:
+        """Validate the persisted row under the caller's transaction lock."""
+        row = db.execute(
+            "SELECT j.*,b.engine FROM jobs j JOIN batches b USING(batch_id) WHERE job_id=?",
+            (job_id.value,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return self._job(row, self._engine(row["engine"]))
 
     @staticmethod
     def _bounds(limit: int, offset: int) -> None:
@@ -391,14 +428,16 @@ class LocalResearchStore:
         self.get_job(job_id)
         with self._connection() as db:
             self._lease(db, token)
+            self._current_job(db, job_id)
             return (
                 db.execute(
                     (
                         "UPDATE jobs SET state='RUNNING',attempt_count=attempt_count+1,claim_toke"
-                        "n=?,failure_code=NULL,failure_message=NULL WHERE job_id=? AND state='PEN"
+                        "n=?,started_at=?,finished_at=NULL,failure_code=NULL,failure_message=NULL "
+                        "WHERE job_id=? AND state='PEN"
                         "DING'"
                     ),
-                    (token, job_id.value),
+                    (token, now(), job_id.value),
                 ).rowcount
                 == 1
             )
@@ -406,13 +445,14 @@ class LocalResearchStore:
     def cancel(self, job_id: BatchJobId) -> bool:
         self.get_job(job_id)
         with self._connection() as db:
-            row = db.execute("SELECT state FROM jobs WHERE job_id=?", (job_id.value,)).fetchone()
-            if row[0] == "RUNNING":
+            current = self._current_job(db, job_id)
+            if current.state == JobState.RUNNING:
                 raise JobNotCancellableError("running financial work cannot be cancelled")
             return (
                 db.execute(
-                    "UPDATE jobs SET state='CANCELLED' WHERE job_id=? AND state='PENDING'",
-                    (job_id.value,),
+                    "UPDATE jobs SET state='CANCELLED',finished_at=? "
+                    "WHERE job_id=? AND state='PENDING'",
+                    (now(), job_id.value),
                 ).rowcount
                 == 1
             )
@@ -420,11 +460,13 @@ class LocalResearchStore:
     def requeue(self, job_id: BatchJobId) -> None:
         self.get_job(job_id)
         with self._connection() as db:
+            self._current_job(db, job_id)
             if (
                 db.execute(
                     (
                         "UPDATE jobs SET state='PENDING',claim_token=NULL,failure_code=NULL,failu"
-                        "re_message=NULL WHERE job_id=? AND state IN ('FAILED','CANCELLED')"
+                        "re_message=NULL,started_at=NULL,finished_at=NULL "
+                        "WHERE job_id=? AND state IN ('FAILED','CANCELLED')"
                     ),
                     (job_id.value,),
                 ).rowcount
@@ -435,13 +477,15 @@ class LocalResearchStore:
     def fail(self, job_id: BatchJobId, token: str, exc: Exception) -> None:
         with self._connection() as db:
             self._lease(db, token)
+            self._current_job(db, job_id)
             if (
                 db.execute(
                     (
                         "UPDATE jobs SET state='FAILED',failure_code=?,failure_message=?,claim_to"
-                        "ken=NULL WHERE job_id=? AND state='RUNNING' AND claim_token=?"
+                        "ken=NULL,finished_at=? WHERE job_id=? AND state='RUNNING' "
+                        "AND claim_token=?"
                     ),
-                    (type(exc).__name__[:80], str(exc)[:1000], job_id.value, token),
+                    (type(exc).__name__[:80], str(exc)[:1000], now(), job_id.value, token),
                 ).rowcount
                 != 1
             ):
@@ -450,10 +494,17 @@ class LocalResearchStore:
     def recover_interrupted_runner(self) -> int:
         """Operator must know the old coordinator is gone; fences all old claims."""
         with self._connection() as db:
+            rows = db.execute(
+                "SELECT j.*,b.engine FROM jobs j JOIN batches b USING(batch_id) "
+                "WHERE state='RUNNING'"
+            ).fetchall()
+            for row in rows:
+                self._job(row, self._engine(row["engine"]))
             count = db.execute(
                 "UPDATE jobs SET state='FAILED',failure_code='INTERRUPTED',failure_messag"
-                "e='Explicit interrupted coordinator recovery',claim_token=NULL WHERE sta"
-                "te='RUNNING'"
+                "e='Explicit interrupted coordinator recovery',claim_token=NULL,finished_at=? "
+                "WHERE state='RUNNING'",
+                (now(),),
             ).rowcount
             db.execute("DELETE FROM runner_lease")
             return count
@@ -583,12 +634,13 @@ class LocalResearchStore:
                 db.execute(
                     (
                         "UPDATE jobs SET state='COMPLETED',claim_token=NULL,result_fingerprint=?,"
-                        "manifest_fingerprint=? WHERE job_id=? AND state='RUNNING' AND claim_toke"
-                        "n=?"
+                        "manifest_fingerprint=?,finished_at=? WHERE job_id=? AND state='RUNNING' "
+                        "AND claim_token=?"
                     ),
                     (
                         record.result_fingerprint,
                         record.manifest_fingerprint,
+                        now(),
                         job.job_id.value,
                         token,
                     ),

@@ -133,3 +133,90 @@ Batch-view precedence is verified by mixed failure/cancellation/completion integ
 **UNPROVEN**: exact final candidate GitHub CI on Python3.13 and3.14; symbolic-link rejection live paths skipped because Windows creation privilege is unavailable. The full local gate ran Python3.14.6. Explicit baseline pre-edit cleanliness is Director-owned evidence because QA began after implementation. Filesystem TOCTOU hostile path replacement is not established by advisory path checks, as Security documents; this is outside the trusted local-store assumption, not a claimed guarantee.
 
 Historical failed evidence above is retained for traceability and superseded by this closure section.
+
+## Independent operational timestamp repair QA
+
+QA inspected the timestamp-only changes in `research/jobs.py` and
+`research/store.py`, the Phase014 operational metadata/attempt contract, and the
+implementation timestamp scenarios. Timestamp reads use canonical UTC text and
+state/attempt presence coherence; wall-clock ordering is deliberately not an
+execution-clock invariant. No migration or schema-version increment is required
+for this unreleased initial schema.
+
+Initial independent checks, isolated `.phase014-workspace`, root `.venv/Scripts`
+tools, `PYTHONPATH=src` for direct Python/import checks:
+
+- Elevated `python.exe -m pytest tests/test_phase014_timestamps.py
+  tests/test_research_batches.py tests/test_phase014_qa.py
+  tests/test_phase014_security.py -q -p no:cacheprovider`: **84 passed, 1 skipped
+  in 31.86s**. Windows symlink privilege skip. This verifies timestamp transitions,
+  strict persisted reads, timestamp-independent financial manifests/index/IDs,
+  and all prior scheduler/index/security regressions before the new Security
+  timestamp tests were introduced.
+- Added independent `tests/test_phase014_timestamp_qa.py` with a real successful
+  second attempt after failure/requeue; attempts/creation/IDs persist, current
+  attempt timestamps replace earlier times, failure metadata clears, and losing
+  terminal operations preserve the completed snapshot across reopening.
+  Elevated focused pytest: **1 passed in 1.70s**.
+- `uv sync --locked --python C:\Users\TradeStation\crypto-command-station\.venv\Scripts\python.exe`
+  with workspace `UV_CACHE_DIR`, elevated: **35 packages checked**.
+- `uv lock --check`, same cache: **35 packages resolved, PASS**.
+- `ruff.exe check .`: **PASS**.
+- `lint-imports.exe`: **4 kept, 0 broken**.
+- `git diff --check`; `git diff --exit-code -- pyproject.toml uv.lock`: **PASS**.
+- Initial `ruff.exe format --check .`: **FAIL** for mixed-newline formatting in
+  changed store SQL and Security's in-progress timestamp test. Initial strict
+  `mypy.exe src tests --cache-dir .mypy-qa014-timestamps`: **FAIL**, Security's
+  in-progress test helper lacked an annotation. These are static-gate/test-source
+  issues, not evidence of a financial behavior defect; owner repair requested.
+
+Full-suite acceptance awaits the coherent post-Security-review candidate. QA
+made no production, dependency, lock, Git publication, or user-checkout changes.
+
+### Final timestamp closure after S014-2 repair
+
+**STATUS: PASS** for final local acceptance. The initial pending verdict and
+static failures above are superseded by these results. QA independently
+inspected the repair: `_current_job` reconstructs and validates the persisted
+row inside the same `BEGIN IMMEDIATE` transaction as claim/cancel/requeue/fail;
+recovery validates every RUNNING row before the bulk update or lease deletion.
+Completion retains its existing transactional reconstruction and index checks.
+The six Security regressions reject malformed/incoherent rows and preserve
+job/lease snapshots, including corruption committed between preflight and the
+mutation transaction and all-or-nothing recovery across multiple jobs.
+
+Final validation uses root `.venv/Scripts` tools from the isolated workspace:
+
+- Elevated `python.exe -m pytest tests/test_phase014_timestamps.py
+  tests/test_phase014_timestamp_qa.py tests/test_phase014_timestamp_security.py
+  tests/test_research_batches.py tests/test_phase014_qa.py
+  tests/test_phase014_security.py -q -p no:cacheprovider`, `PYTHONPATH=src`:
+  **91 passed, 1 skipped in 34.32s**. All six new integrity regressions and all
+  prior index/scheduler regressions pass. Skip: Windows symlink privilege.
+- `ruff.exe format --check .`: **212 files already formatted**.
+- `ruff.exe check .`: **All checks passed**.
+- `mypy.exe src tests --cache-dir .mypy-qa014-timestamps`:
+  **no issues in 175 source files**.
+- `lint-imports.exe`, `PYTHONPATH=src`: **4 kept, 0 broken**.
+- `git diff --check`; `git diff --exit-code -- pyproject.toml uv.lock`: **PASS**.
+- Elevated `python.exe -m pytest -q -p no:cacheprovider`, `PYTHONPATH=src`:
+  **595 passed, 5 skipped in 67.99s**, **600 total tests**. All five skips are
+  unavailable Windows symbolic-link creation privilege, not product failures.
+
+Previously recorded locked sync and lock checks remain applicable: dependency
+and lock files are unchanged throughout both timestamp repairs. Final functional
+coverage includes every specified current-attempt timestamp transition, reopen,
+strict UTC/state coherence, retry identity/attempt preservation, losing terminal
+operations, and identical deterministic run/job/batch IDs, financial manifests,
+and index content when operational clocks differ. Scope remains the timestamp
+metadata contract and its transaction integrity; no migration/history/v2 schema,
+financial-layer/dependency changes, automatic retry, future-phase work, or Git
+publication was introduced. QA modified only its focused timestamp regression
+and this evidence document.
+
+**DEFECTS:** no outstanding confirmed defects within reviewed scope; S014-2 and
+initial formatting/type failures are closed.
+
+**UNPROVEN/RISKS:** exact final candidate GitHub Python3.13/3.14 CI is not local
+QA evidence; the five privileged symbolic-link paths remain unproven locally.
+Existing trusted-local-store filesystem TOCTOU limitation remains unchanged.

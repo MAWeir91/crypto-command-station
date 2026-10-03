@@ -110,3 +110,81 @@ Three authorized repair validation executions:
 Only `research/batches.py` and this implementation evidence changed for the second
 repair. QA tests and reviewer evidence were preserved. Full acceptance remains
 independent QA-owned.
+
+## Operational timestamp contract repair
+
+`JobView` and the initial SQLite v1 job schema now include nullable `started_at`
+and `finished_at`. Submission has neither; the successful atomic claim increments
+the attempt and sets its start; completion, ordinary failure, and explicit
+INTERRUPTED recovery retain that start and set the finish. Pending cancellation
+sets only the finish. Explicit requeue clears both current-attempt times while
+preserving creation, attempts, and deterministic identities. No migration,
+attempt-history table, schema-version bump, or scheduler change was introduced.
+
+Persisted job reconstruction rejects malformed/noncanonical/non-UTC timestamps
+and state/attempt/timestamp presence inconsistencies. Canonical timestamps use
+`datetime.now(UTC).isoformat()` with `+00:00`. Wall-clock ordering is not imposed:
+UTC clocks can move backwards and these operational values are not a monotonic
+financial clock. Two real service executions with different operational times
+produce identical run/job/batch identities, immutable manifests, and deterministic
+index records.
+
+Six implementation validation executions (root `.venv/Scripts` tools, isolated
+Phase 014 working directory):
+
+1. `ruff.exe format src/command_station/research/jobs.py
+   src/command_station/research/store.py tests/test_phase014_timestamps.py`:
+   two files reformatted, one unchanged.
+2. Elevated `python.exe -m pytest tests/test_phase014_timestamps.py
+   tests/test_research_batches.py -q -p no:cacheprovider`, `PYTHONPATH=src`:
+   **45 passed, 4 failed in 17.79 seconds**. TEST DEFECT: the new test incorrectly
+   expected pending-only scheduling to read nonpending rows; unfiltered public
+   reads rejected all corrupt rows. Assertion narrowed to corrupt pending rows.
+3. `ruff.exe check` on those three changed Python files: two line-length issues;
+   corrected by splitting SQL strings.
+4. `mypy.exe src/command_station/research/jobs.py
+   src/command_station/research/store.py --cache-dir .mypy-phase014-timestamps`:
+   **no issues in two source files**.
+5. Repeat of execution 2 after the test/string corrections:
+   **49 passed in 16.80 seconds**, no skips.
+6. Repeat of execution 3: **all checks passed**.
+
+Implementation validation is complete at the six-execution handoff boundary.
+Independent QA owns broad gates, final format checking, and security/scheduler
+regression acceptance. Dependencies, lockfile, financial contracts, and adjacent
+phases are unchanged. No staging, commit, push, or merge was performed.
+
+## S014-2 timestamp mutation integrity repair
+
+Security review demonstrated that corrupt current-attempt timestamps could be
+overwritten by failure/recovery, and that a separate writer could corrupt metadata
+between the existing preflight read and claim/cancel/requeue's write transaction.
+Every affected current job is now reconstructed and validated inside the same
+`BEGIN IMMEDIATE` transaction that performs its state update. Existing preflight
+reads remain, but transaction-local validation is authoritative for mutation.
+Completion already validates the current row inside its write transaction and
+retains that protection unchanged.
+
+Explicit recovery validates every RUNNING row before its bulk terminal update or
+lease deletion. If any row is corrupt, the transaction rolls back with all job
+rows and the runner lease unchanged. Healthy recovery and lease/CAS fencing keep
+their existing semantics. Ruff formatting also normalized the mixed line endings
+reported by QA. Reviewer tests, financial logic, scheduler, index, dependencies,
+and schema version were unchanged.
+
+Three authorized implementation validation executions:
+
+1. Root `.venv/Scripts/ruff.exe format src/command_station/research/store.py`:
+   **one file reformatted**.
+2. Elevated root `.venv/Scripts/python.exe -m pytest
+   tests/test_phase014_timestamp_security.py tests/test_phase014_timestamps.py
+   tests/test_research_batches.py -q -p no:cacheprovider`, `PYTHONPATH=src`:
+   **55 passed in 18.53 seconds**, no skips. Includes all six permanent security
+   regressions for corrupt-row preservation, lease preservation, and write-boundary
+   timestamp validation, plus lifecycle and existing batch regressions.
+3. Root `.venv/Scripts/mypy.exe src/command_station/research/store.py
+   --cache-dir .mypy-phase014-timestamp-transactions`:
+   **no issues in one source file**.
+
+At the authorized three-execution handoff boundary, independent QA/Security own
+closure and broad gates. No staging, commit, push, or merge was performed.

@@ -50,3 +50,89 @@ Reviewed final `research/batches.py` after Q014-2 repair and the permanent QA co
 This final review was targeted inspection only. Implementer reported50 focused passes/1 symlink skip after scheduler repair; QA independently owns confirming Q014-2, parallel execution and broad gates. The earlier independent Security24-pass index packet is unchanged by the scheduler-only production repair. Adversarial filesystem replacement races remain unproven as described above.
 
 RECOMMENDATION: no further bounded security repair. Incorporate independent QA's final fatal-dispatch and repository-gate evidence before final phase acceptance.
+
+## Operational timestamp review: S014-2, medium, mutation bypasses integrity
+
+STATUS: FAIL for the operational timestamp repair pending closure of S014-2.
+Earlier index and scheduler closure remains intact.
+
+The assigned contract requires rejection of malformed UTC metadata and
+state/attempt/timestamp inconsistency before public reads and lifecycle mutations.
+`_job` enforces this for reconstructed rows, and `complete` reconstructs its
+current row within the same `BEGIN IMMEDIATE` transaction as completion/indexing.
+However, `fail` and `recover_interrupted_runner` never reconstruct their affected
+rows. An existing RUNNING row with `finished_at` set to a corrupt BLOB is rejected
+by `get_job`, then silently overwritten with a canonical finish by failure or
+recovery. Recovery also deletes the lease. With two RUNNING rows, a missing start
+in one row does not block recovery: both rows are mutated and the lease revoked,
+even though the malformed row remains unreadable afterward.
+
+`claim`, `cancel`, and `requeue` reconstruct their row through `get_job` before
+opening the mutation transaction. A separate SQLite writer can commit malformed
+metadata between that preflight read and `BEGIN IMMEDIATE`. Each transition then
+overwrites the corrupt finish without rejecting it. This is a deterministic
+interleaving of a real separate SQLite commit; the regression wraps only the
+preflight read, preserving the actual SQL mutation implementation. CAS state
+predicates continue to prevent duplicate ordinary transitions but do not establish
+integrity of the current row when the write begins.
+
+Permanent regressions in `tests/test_phase014_timestamp_security.py` cover
+failure/recovery laundering, claim/cancel/requeue interleavings, and all-row
+recovery rollback. Rejection assertions require the exact corrupted job rows and
+lease to remain unchanged; the tests intentionally remain red for the implementer.
+
+Executed independent evidence: elevated root `.venv/Scripts/python.exe -m pytest
+tests/test_phase014_timestamp_security.py -q -p no:cacheprovider`, with
+`PYTHONPATH=src` in `.phase014-workspace`: initial **3 failed in 1.62s**;
+consolidated **6 failed in 2.14s**, all `DID NOT RAISE ResearchStoreError` at the
+mutating operation. Public read rejection in the terminal tests passed first.
+Root `.venv/Scripts/ruff.exe check tests/test_phase014_timestamp_security.py`:
+**all checks passed**. Final `ruff format` reformatted the owned test file, and
+`PYTHONPATH=src; mypy src/command_station/research/store.py
+tests/test_phase014_timestamp_security.py --cache-dir .mypy-security014-timestamps`:
+**success, no issues in two source files**. No production edits or publication by
+Security.
+
+UNPROVEN: transaction-scoped metadata integrity and preservation on rejection
+cannot be established until this finding is repaired. Broader QA gates and prior
+Windows privilege limitations remain owned/reported separately. No chronological
+ordering requirement is imposed on operational wall-clock timestamps.
+
+RECOMMENDATION: reconstruct and validate each affected current row inside its
+mutation transaction before any UPDATE. For recovery, validate all RUNNING rows
+before the bulk update or lease deletion so any rejection rolls back everything.
+Keep completion's existing transaction-scoped validation and CAS/lease fences.
+Then independently rerun the six permanent regressions and the existing timestamp
+lifecycle acceptance cases.
+
+## Independent S014-2 closure
+
+STATUS: PASS for the bounded operational timestamp security review; S014-2 closed.
+
+Independent rerun of the same six permanent adversarial regressions with elevated
+root `.venv/Scripts/python.exe -m pytest tests/test_phase014_timestamp_security.py
+-q -p no:cacheprovider`, `PYTHONPATH=src`, in `.phase014-workspace`:
+**6 passed in 1.31s**. These assertions prove malformed bytes and exact lease/job
+rows survive rejection unchanged, including the preflight/write interleavings and
+multirow recovery rollback.
+
+Targeted final diff inspection confirms `_current_job` reads and reconstructs the
+current row inside the caller's `_connection` transaction. Claim, cancellation,
+requeue, and failure invoke it before updating. `_connection` acquires
+`BEGIN IMMEDIATE` before validation and rolls back on any exception. Recovery
+reads and validates all RUNNING rows before its bulk UPDATE or lease deletion.
+Completion retains its existing transaction-scoped reconstruction, identity checks,
+index consistency checks, and claim-token CAS. Existing lease fencing is retained.
+
+The metadata repair changes only JobView's two operational fields, initial job
+schema, persisted-row validation, and operational lifecycle writes in the reviewed
+production diff. BatchRunId/BatchJobId derivation, BacktestRunId/spec fingerprints,
+ResultIndexRecord.deterministic(), financial runtime, and artifact publication
+identity surfaces are unchanged. Timestamp chronology is intentionally unrestricted.
+
+No additional concrete finding in the bounded repair. Earlier filesystem TOCTOU
+and Windows privilege limitations remain unproven as documented above; broad
+repository gates belong to QA. No production edits or publication by Security.
+
+RECOMMENDATION: accept the bounded timestamp security closure; incorporate QA's
+final lifecycle/regression and repository-gate evidence for phase acceptance.
